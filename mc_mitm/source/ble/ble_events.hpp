@@ -39,6 +39,9 @@ namespace ams::ble::events {
 
     void SetTarget(const bluetooth::Address *address);
     bool GetTarget(bluetooth::Address *out);
+    // An address a link may come up for without a target being set (a controller remembered from an earlier
+    // boot); SetTarget records its address the same way
+    void RememberAttempted(const bluetooth::Address *address);
     void SetConnection(u32 conn_id);
     u32 GetConnection();
     bool IsDisconnected();
@@ -64,6 +67,12 @@ namespace ams::ble::events {
     void SetInquiryActive(bool active);
     bool IsPairingWindowOpen();
 
+    // Classic Bluetooth activity: btm stopping its inquiry (it found a controller and is about to connect to
+    // it), and connection or pairing events for classic devices. A BLE scan running at the same time as a
+    // classic connection being set up crashes the stack, so scans keep clear of it for a while.
+    void NoteClassicActivity();
+    bool ClassicActivityWithin(TimeSpan span);
+
     // Set when the stack reports the bond with the target complete (core Connection event)
     bool TakeBondComplete();
 
@@ -75,6 +84,7 @@ namespace ams::ble::events {
 
     // Last GATT client btm registered, usable as ours since btm never connects with it on a retail console
     u8 GetSpareClientIf();
+    void ClearSpareClientIf();
 
     /* Queue consumed by the host thread */
     u32 TakeRingDropped();

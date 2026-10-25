@@ -56,6 +56,84 @@ namespace ams::ble {
         constinit os::SdkMutex g_controller_lock;
         std::shared_ptr<controller::XboxOneBleController> g_controller;
 
+        // Withdrawn from hid while the Controllers screen is open, as the screen does with every controller;
+        // the link stays up and the controller comes back on LB+RB (any button once the screen is closed)
+        constinit bool g_parked = false;
+        constinit s64 g_present_tick = 0;
+
+        // hid registers a controller on the first input report it sees after re-reading btm's device list, which
+        // it does some time after being signalled; a report sent straight after the signal is dropped and the
+        // controller only appeared once a button was pressed. The pad's resting state is therefore delivered a
+        // few times over the next seconds (ticks at which a copy is due, zero once sent).
+        constexpr size_t NeutralReportCount = 4;
+        constexpr s64 NeutralReportDelaysMs[NeutralReportCount] = { 0, 300, 1000, 2500 };
+        constinit s64 g_neutral_due[NeutralReportCount] = {};
+
+        constexpr u8 NeutralReport[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
+
+        void ScheduleNeutralReports() {
+            const s64 now = os::GetSystemTick().GetInt64Value();
+            std::scoped_lock lk(g_controller_lock);
+            for (size_t i = 0; i < NeutralReportCount; ++i) {
+                g_neutral_due[i] = now + os::ConvertToTick(TimeSpan::FromMilliSeconds(NeutralReportDelaysMs[i])).GetInt64Value();
+            }
+        }
+
+        void ServiceNeutralReports() {
+            std::shared_ptr<controller::XboxOneBleController> controller;
+            bool due = false;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                const s64 now = os::GetSystemTick().GetInt64Value();
+                for (size_t i = 0; i < NeutralReportCount; ++i) {
+                    if ((g_neutral_due[i] != 0) && (now >= g_neutral_due[i])) {
+                        g_neutral_due[i] = 0;
+                        due = true;
+                    }
+                }
+                if (due && !g_parked) {
+                    controller = g_controller;
+                }
+            }
+            if (controller) {
+                static_cast<void>(controller->HandleInputReport(NeutralReport, sizeof(NeutralReport)));
+            }
+        }
+
+        /* Report layout on the LE HID stream: XboxOneInputReport0x01 without the report id */
+        constexpr size_t ReportOffsetTriggers = 8;
+        constexpr size_t ReportOffsetDpad     = 12;
+        constexpr size_t ReportOffsetButtons  = 13;
+        constexpr u8 ReportButtonsLbRb        = 0xC0;
+
+        bool ReportHasLbRb(const u8 *data, size_t size) {
+            return (size > ReportOffsetButtons) && ((data[ReportOffsetButtons] & ReportButtonsLbRb) == ReportButtonsLbRb);
+        }
+
+        bool ReportHasAnyInput(const u8 *data, size_t size) {
+            for (size_t i = ReportOffsetTriggers; i < std::min(size, sizeof(controller::XboxOneInputReport0x01)); ++i) {
+                if (data[i] != 0) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void Unpark() {
+            std::shared_ptr<controller::XboxOneBleController> controller;
+            {
+                std::scoped_lock lk(g_controller_lock);
+                if (!g_parked || !g_controller) {
+                    return;
+                }
+                g_parked = false;
+                controller = g_controller;
+            }
+            controller::ReattachVirtualController(controller);
+            ScheduleNeutralReports();
+            log::Write("controller presented to the system again");
+        }
+
         /* Advertisement parsing */
 
         struct AdvertisementSummary {
@@ -127,13 +205,24 @@ namespace ams::ble {
                 }
 
                 if ((notify.type == GattNotifyType_Notification) && IsUuid16(notify.char_uuid, GattCharReport)) {
+                    const size_t size = std::min<size_t>(notify.size, sizeof(notify.data));
                     std::shared_ptr<controller::XboxOneBleController> controller;
+                    bool parked;
                     {
                         std::scoped_lock lk(g_controller_lock);
                         controller = g_controller;
+                        parked = g_parked;
+                    }
+                    if (parked) {
+                        // What brings a controller back on the Controllers screen is L+R; afterwards any button does
+                        if (ReportHasLbRb(notify.data, size) || (!events::IsPairingWindowOpen() && ReportHasAnyInput(notify.data, size))) {
+                            Unpark();
+                        } else {
+                            continue;
+                        }
                     }
                     if (controller) {
-                        static_cast<void>(controller->HandleInputReport(notify.data, std::min<size_t>(notify.size, sizeof(notify.data))));
+                        static_cast<void>(controller->HandleInputReport(notify.data, size));
                     }
                 } else {
                     events::NoteGattResult(notify.result);
@@ -221,9 +310,159 @@ namespace ams::ble {
             }
         }
 
+        /* Auto-connect: the remembered controller, reconnected by the stack when it comes back */
+
+        constexpr const char LastDevicePath[] = "sdmc:/config/MissionControl/ble_last_device.bin";
+
+        constinit os::SdkMutex g_autoconnect_lock;
+        constinit bool g_have_remembered = false;
+        constinit bluetooth::Address g_remembered = {};
+
+        bool AutoConnectEnabled() {
+            return mitm::GetGlobalConfig()->ble.auto_connect;
+        }
+
+        void LoadRememberedDevice() {
+            if (!AutoConnectEnabled()) {
+                return;
+            }
+
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), LastDevicePath, fs::OpenMode_Read))) {
+                log::Write("auto-connect: no remembered controller");
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+
+            bluetooth::Address address;
+            size_t read = 0;
+            if (R_FAILED(fs::ReadFile(std::addressof(read), file, 0, std::addressof(address), sizeof(address))) || (read != sizeof(address))) {
+                return;
+            }
+
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                g_remembered = address;
+                g_have_remembered = true;
+            }
+            events::RememberAttempted(&address);
+            events::LogAddress("auto-connect: remembered controller", address);
+        }
+
+        void SaveRememberedDevice(const bluetooth::Address &address) {
+            {
+                std::scoped_lock lk(g_autoconnect_lock);
+                if (g_have_remembered && AddressEqual(g_remembered, address)) {
+                    return;
+                }
+                g_remembered = address;
+                g_have_remembered = true;
+            }
+
+            if (!AutoConnectEnabled()) {
+                return;
+            }
+
+            static_cast<void>(fs::CreateFile(LastDevicePath, sizeof(address)));
+            fs::FileHandle file;
+            if (R_FAILED(fs::OpenFile(std::addressof(file), LastDevicePath, fs::OpenMode_Write))) {
+                log::Write("auto-connect: could not save the controller");
+                return;
+            }
+            ON_SCOPE_EXIT { fs::CloseFile(file); };
+            static_cast<void>(fs::SetFileSize(file, sizeof(address)));
+            static_cast<void>(fs::WriteFile(file, 0, std::addressof(address), sizeof(address), fs::WriteOption::Flush));
+            events::LogAddress("auto-connect: saved controller", address);
+        }
+
+        bool GetRememberedDevice(bluetooth::Address *out) {
+            std::scoped_lock lk(g_autoconnect_lock);
+            if (g_have_remembered) {
+                *out = g_remembered;
+            }
+            return g_have_remembered;
+        }
+
+        // A background connection request (ConnectGattServer with is_direct=false) was tried first: the stack
+        // accepted it but never connected when the controller was switched on by its Xbox button, and the
+        // request could not be cancelled afterwards (0x29e71). Without a Secure Connections bond the controller
+        // has no console to reconnect to and just switches itself off again, so the Xbox button alone cannot
+        // bring it back. What works outside the Controllers screen is the sync button: the controller then
+        // advertises to anyone, and a scan finds it at once since btm's inquiry only runs while the screen is
+        // open. Scanning in bursts while no controller is connected keeps the radio mostly free.
+        // No BLE scan runs within this long of classic activity (a controller being connected or paired): the
+        // stack crashed, and btm cycled the radio, every time a scan was running while a classic controller
+        // connected (seven times in a row in one session, 10-13 s after each scan started)
+        constexpr TimeSpan ClassicActivityHoldOff = TimeSpan::FromSeconds(12);
+
+        constexpr TimeSpan BackgroundScanDuration = TimeSpan::FromMilliSeconds(2500);
+        constexpr TimeSpan BackgroundScanPause    = TimeSpan::FromMilliSeconds(2000);
+
+        bool BackgroundScanWanted() {
+            return AutoConnectEnabled() && g_have_remembered && events::IsRadioEnabled() && !events::IsPairingWindowOpen();
+        }
+
+        // Set when PrepareForSleep dropped the link: that end of link is no reason to cycle the radio on wake
+        constinit bool g_dropped_for_sleep = false;
+
+        // EXPERIMENT. The stack refuses every CreateBond for a controller that has been switched off until the
+        // console restarts. A restart is not the only thing that resets the stack: btm cycles the radio whenever
+        // btdrv reports a BluetoothCrash, which is how BLE came up in PrepareClient. Ask btdrv for one and pick up
+        // the GATT client btm registers afterwards, as the bring-up does.
+        void RecycleRadio() {
+            if (g_dropped_for_sleep) {
+                g_dropped_for_sleep = false;
+                log::Write("link was dropped for sleep, no radio cycle");
+                return;
+            }
+
+            if (!mitm::GetGlobalConfig()->ble.radio_cycle || !events::IsRadioEnabled()) {
+                return;
+            }
+
+            events::ClearSpareClientIf();
+
+            Result rc = btdrvEmulateBluetoothCrash(BtdrvFatalReason_Unknown1);
+            log::Write("radio cycle: btdrvEmulateBluetoothCrash rc=0x%x", rc.GetValue());
+            if (R_FAILED(rc)) {
+                return;
+            }
+
+            events::Pump(TimeSpan::FromSeconds(6));
+            g_pairing_failed_tick = 0;
+
+            if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
+                g_client_if = spare;
+                log::Write("radio cycle: btm brought BLE back up, using gatt client_if=%u", g_client_if);
+                return;
+            }
+
+            // btm did not bring BLE back up on its own; do what the bring-up does
+            rc = btdrvEnableBle();
+            log::Write("radio cycle: btdrvEnableBle rc=0x%x", rc.GetValue());
+            events::Pump(TimeSpan::FromSeconds(6));
+
+            if (u8 spare = events::GetSpareClientIf(); spare != InvalidClientIf) {
+                g_client_if = spare;
+                log::Write("radio cycle: using gatt client_if=%u", g_client_if);
+                return;
+            }
+
+            for (int attempt = 0; attempt < 3; ++attempt) {
+                if (R_SUCCEEDED(RegisterGattClient())) {
+                    log::Write("radio cycle: registered gatt client_if=%u", g_client_if);
+                    return;
+                }
+                os::SleepThread(TimeSpan::FromSeconds(2));
+            }
+
+            log::Write("radio cycle: no gatt client available, keeping client_if=%u", g_client_if);
+        }
+
         /* Finding and connecting the controller */
 
-        Result Scan(bluetooth::Address *out_address, TimeSpan duration) {
+        // With `only` set, nothing but that controller is accepted (background scans outside the pairing window)
+        Result Scan(bluetooth::Address *out_address, TimeSpan duration, const bluetooth::Address *only = nullptr) {
             events::SetScanning(true);
             ON_SCOPE_EXIT { events::SetScanning(false); };
 
@@ -234,26 +473,72 @@ namespace ams::ble {
             events::ExpectFilterEvent();
             static_cast<void>(btdrvEnableBleScanFilter(false));
 
-            Result rc = btdrvStartBleScan();
+            // The two filter calls answer asynchronously; let them land before asking for the scan
+            for (int i = 0; i < 2; ++i) {
+                events::WaitFor(BtdrvBleEventType_ScanFilter, TimeSpan::FromMilliSeconds(400), nullptr, [](const EventRecord &) { return true; });
+            }
+
+            // The stack refuses the scan (0x2a871) for as long as btm's classic inquiry has the radio: 10.24 s at
+            // a time from the moment the Controllers screen opens, repeated with hardly a gap while it stays
+            // open. Keep asking while the screen is open; outside it the scan starts at once.
+            Result rc;
+            int attempts = 0;
+            const bool in_window = events::IsPairingWindowOpen();
+            for (;;) {
+                if (events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    log::Write("scan not started: a classic controller is connecting");
+                    events::Pump(TimeSpan::FromSeconds(1));
+                    R_THROW(svc::ResultCancelled());
+                }
+                rc = btdrvStartBleScan();
+                if (R_SUCCEEDED(rc) || (++attempts >= (in_window ? 150 : 3)) || (in_window && !events::IsPairingWindowOpen())) {
+                    break;
+                }
+                if (attempts == 1) {
+                    log::Write("btdrvStartBleScan rc=0x%x, retrying", rc.GetValue());
+                }
+                events::Pump(TimeSpan::FromMilliSeconds(200));
+            }
             if (R_FAILED(rc)) {
-                log::Write("btdrvStartBleScan rc=0x%x", rc.GetValue());
+                log::Write("btdrvStartBleScan rc=0x%x after %d attempts", rc.GetValue(), attempts);
                 events::Pump(TimeSpan::FromSeconds(1));
                 return rc;
+            }
+            if (attempts > 0) {
+                log::Write("scanning (%d refused attempts first)", attempts);
             }
 
             EventRecord e;
             // Ends early if a link came up by itself or the console is going to sleep
-            const bool found = events::WaitFor(events::InvalidType, duration, &e, [](const EventRecord &r) {
-                if (r.type != BtdrvBleEventType_ScanResult) {
-                    return events::HasAdoptedConnection() || !events::IsRadioEnabled();
+            // Waited for in short slices so that the scan can be stopped as soon as a classic controller starts
+            // connecting (see NoteClassicActivity), not only when an event happens to arrive
+            const auto deadline = os::GetSystemTick().ToTimeSpan() + duration;
+            bool found = false;
+            bool aborted = false;
+            for (;;) {
+                const auto now = os::GetSystemTick().ToTimeSpan();
+                if (now >= deadline) {
+                    break;
                 }
-                if (r.info.scan_result.status != BleScanStatus_NewDevice) {
-                    return false;
+                found = events::WaitFor(BtdrvBleEventType_ScanResult, std::min(deadline - now, TimeSpan::FromMilliSeconds(250)), &e, [only](const EventRecord &r) {
+                    if (r.info.scan_result.status != BleScanStatus_NewDevice) {
+                        return false;
+                    }
+                    if (only) {
+                        return AddressEqual(r.info.scan_result.address, *only);
+                    }
+                    AdvertisementSummary summary;
+                    ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
+                    return IsXboxController(summary);
+                });
+                if (found) {
+                    break;
                 }
-                AdvertisementSummary summary;
-                ParseAdvertisements(r.info.scan_result.ad_list, r.info.scan_result.count, &summary);
-                return IsXboxController(summary);
-            });
+                if (events::HasAdoptedConnection() || !events::IsRadioEnabled() || events::ClassicActivityWithin(ClassicActivityHoldOff)) {
+                    aborted = true;
+                    break;
+                }
+            }
 
             static_cast<void>(btdrvStopBleScan());
             events::ExpectFilterEvent();
@@ -262,7 +547,10 @@ namespace ams::ble {
             // The scan-complete and filter events trail the calls above
             events::Pump(TimeSpan::FromSeconds(1));
 
-            R_UNLESS(!events::HasAdoptedConnection() && events::IsRadioEnabled(), svc::ResultCancelled());
+            if (aborted && !events::HasAdoptedConnection() && events::IsRadioEnabled()) {
+                log::Write("scan stopped: a classic controller is connecting");
+            }
+            R_UNLESS(!aborted, svc::ResultCancelled());
             R_UNLESS(found, svc::ResultTimedOut());
 
             *out_address = e.info.scan_result.address;
@@ -349,7 +637,8 @@ namespace ams::ble {
                     break;
                 }
                 if (events::TakeBondComplete()) {
-                    events::Pump(TimeSpan::FromSeconds(1));
+                    // A refusal drops the link within a few hundred milliseconds of this event
+                    events::Pump(TimeSpan::FromMilliSeconds(500));
                     if (!events::IsDisconnected()) {
                         log::Write("paired");
                         return true;
@@ -372,27 +661,36 @@ namespace ams::ble {
             {
                 std::scoped_lock lk(g_controller_lock);
                 g_controller = controller;
+                g_parked = false;
+                g_present_tick = os::GetSystemTick().GetInt64Value();
             }
             controller::AttachVirtualController(controller);
             g_pairing_failed_tick = 0;
+            SaveRememberedDevice(address);
 
-            // hid registers a controller on the first input report, and the pad only reports when something is
-            // touched, so its resting state is delivered once here (sticks centred, nothing pressed)
-            u8 neutral[sizeof(controller::XboxOneInputReport0x01)] = { 0x00, 0x80, 0x00, 0x80, 0x00, 0x80, 0x00, 0x80 };
-            static_cast<void>(controller->HandleInputReport(neutral, sizeof(neutral)));
+            // The pad only reports when something is touched, so its resting state (sticks centred, nothing
+            // pressed) is delivered for it, now and again over the next seconds, see ScheduleNeutralReports
+            ScheduleNeutralReports();
+            ServiceNeutralReports();
 
             log::Write("controller presented to the system");
         }
 
         void Dismiss(const bluetooth::Address &address) {
             std::shared_ptr<controller::XboxOneBleController> controller;
+            bool parked;
             {
                 std::scoped_lock lk(g_controller_lock);
                 controller = std::move(g_controller);
                 g_controller = nullptr;
+                parked = g_parked;
+                g_parked = false;
+                for (auto &due : g_neutral_due) {
+                    due = 0;
+                }
             }
 
-            if (controller) {
+            if (controller && !parked) {
                 controller::DetachVirtualController(address);
                 log::Write("controller removed from the system");
             }
@@ -421,7 +719,8 @@ namespace ams::ble {
 
         void RunConnected(u32 conn_id) {
             for (;;) {
-                events::Pump(TimeSpan::FromSeconds(1));
+                events::Pump(TimeSpan::FromMilliSeconds(250));
+                ServiceNeutralReports();
 
                 if (gatt::TakeRediscovered()) {
                     log::Write("services re-discovered, subscribing again");
@@ -461,6 +760,7 @@ namespace ams::ble {
 
             StartLeHidListener();
             events::SetSink(gatt::OnEvent);
+            LoadRememberedDevice();
 
             for (;;) {
                 WaitForRadio();
@@ -469,11 +769,21 @@ namespace ams::ble {
                 u32 conn_id = InvalidConnId;
 
                 bool connected = Adopt(&address, &conn_id);
-                if (!connected && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive()) {
-                    Result rc = Scan(&address, TimeSpan::FromSeconds(10));
+
+                // Any gamepad in pairing mode while the Controllers screen is open; only the remembered one,
+                // in short bursts, the rest of the time
+                bluetooth::Address remembered;
+                const bool classic_busy = events::ClassicActivityWithin(ClassicActivityHoldOff);
+                const bool in_window = !classic_busy && events::IsPairingWindowOpen() && events::IsRadioEnabled() && !PairingBackoffActive();
+                const bool background = !classic_busy && !in_window && !PairingBackoffActive() && BackgroundScanWanted() && GetRememberedDevice(&remembered);
+                if (!connected && (in_window || background)) {
+                    Result rc = in_window ? Scan(&address, TimeSpan::FromSeconds(10)) : Scan(&address, BackgroundScanDuration, &remembered);
                     if (Adopt(&address, &conn_id)) {
                         connected = true;
                     } else if (R_SUCCEEDED(rc)) {
+                        if (background) {
+                            log::Write("remembered controller is in pairing mode, connecting");
+                        }
                         connected = R_SUCCEEDED(Connect(address, &conn_id, TimeSpan::FromSeconds(15)));
                         if (!connected) {
                             Disconnect();
@@ -482,7 +792,7 @@ namespace ams::ble {
                 }
 
                 if (!connected) {
-                    os::SleepThread(TimeSpan::FromSeconds(2));
+                    os::SleepThread(background ? BackgroundScanPause : TimeSpan::FromSeconds(2));
                     continue;
                 }
 
@@ -495,6 +805,8 @@ namespace ams::ble {
                     g_pairing_failed_tick = os::GetSystemTick().GetInt64Value();
                     log::Write("backing off for %lds before trying to pair again", PairingRetryBackoff.GetSeconds());
                     Disconnect();
+                    // A cycle clears the backoff: the next attempt is against a fresh stack
+                    RecycleRadio();
                     os::SleepThread(TimeSpan::FromSeconds(1));
                     continue;
                 }
@@ -520,8 +832,10 @@ namespace ams::ble {
                 RunConnected(conn_id);
 
                 // Nothing beyond the teardown is asked of the stack once the link is gone: removing the bond and
-                // detaching the HID host layer here were both tried and changed nothing
+                // detaching the HID host layer here were both tried and changed nothing. A radio cycle is the one
+                // thing left to try (skipped when the link ended because the console is going to sleep).
                 Disconnect();
+                RecycleRadio();
             }
         }
 
@@ -560,6 +874,70 @@ namespace ams::ble {
         if (g_launched) {
             os::WaitThread(&g_thread);
         }
+    }
+
+    void OnPairingWindow(bool open) {
+        // btm restarts its inquiry every 10 s while the screen stays open, and stops and restarts it within a
+        // few seconds when a controller connects; only a start after a quiet spell is the screen being opened.
+        // A controller that was presented from within the screen stays, as any newly paired controller does.
+        constexpr TimeSpan NewSessionGap = TimeSpan::FromSeconds(15);
+        static constinit s64 s_last_close_tick = 0;
+
+        const os::Tick now = os::GetSystemTick();
+        if (!open) {
+            // A parked controller comes back on its next button press, see LeHidThreadFunc
+            s_last_close_tick = now.GetInt64Value();
+            return;
+        }
+
+        if ((s_last_close_tick != 0) && ((now - os::Tick(s_last_close_tick)).ToTimeSpan() < NewSessionGap)) {
+            return;
+        }
+
+        std::shared_ptr<controller::XboxOneBleController> controller;
+        {
+            std::scoped_lock lk(g_controller_lock);
+            if (!g_controller || g_parked || ((now - os::Tick(g_present_tick)).ToTimeSpan() < NewSessionGap)) {
+                return;
+            }
+            g_parked = true;
+            controller = g_controller;
+            for (auto &due : g_neutral_due) {
+                due = 0;
+            }
+        }
+        controller::DetachVirtualController(controller->Address());
+        log::Write("controller withdrawn while the Controllers screen is open, LB+RB brings it back");
+    }
+
+    // EXPERIMENT. A controller left connected wakes the console a few seconds after it goes to sleep. The link
+    // is dropped here, from the power module thread, while the bluetooth module is still awake (it is listed as
+    // a dependency of ours), so that nothing is left on the air by the time the radio goes down. The host thread
+    // sees the radio marked unavailable and stays off it until FullAwake.
+    void PrepareForSleep() {
+        const bool was_enabled = events::IsRadioEnabled();
+        events::SetRadioEnabled(false);
+
+        // MinimumAwake and SleepReady both come through here; only the first one has anything to do
+        if (!g_launched || !was_enabled) {
+            return;
+        }
+
+        const u32 conn_id = events::GetConnection();
+        if ((conn_id == InvalidConnId) || events::IsDisconnected()) {
+            log::Write("going to sleep, no link to drop");
+            return;
+        }
+
+        g_dropped_for_sleep = true;
+        Result rc = btdrvDisconnectGattServer(conn_id);
+        log::Write("going to sleep: btdrvDisconnectGattServer conn_id=%u rc=0x%x", conn_id, rc.GetValue());
+
+        // The disconnection is reported on btdrv's event thread, independently of the host thread
+        for (int i = 0; (i < 30) && !events::IsDisconnected(); ++i) {
+            os::SleepThread(TimeSpan::FromMilliSeconds(50));
+        }
+        log::Write(events::IsDisconnected() ? "link down before sleep" : "link still up as sleep begins");
     }
 
 }

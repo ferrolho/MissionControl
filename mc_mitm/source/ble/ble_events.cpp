@@ -66,6 +66,7 @@ namespace ams::ble::events {
         constinit bool g_radio_cycled = false;
 
         constinit s64 g_inquiry_started_tick = 0;
+        constinit s64 g_classic_activity_tick = 0;
         constinit bool g_bond_complete = false;
 
         constinit Sink g_sink = nullptr;
@@ -190,6 +191,12 @@ namespace ams::ble::events {
                 log::Write("btdrvRespondToSspRequest(accept) rc=0x%x", rc.GetValue());
                 return true;
             }
+            NoteClassicActivity();
+            return false;
+        }
+
+        if (type == BtdrvEventType_PairingPinCodeRequest) {
+            NoteClassicActivity();
             return false;
         }
 
@@ -198,6 +205,7 @@ namespace ams::ble::events {
             if (!is_ours(connection.addr)) {
                 // btm's own events run through here under the core event lock; writing the log there would put
                 // an SD card access in front of every classic Bluetooth connection
+                NoteClassicActivity();
                 return false;
             }
 
@@ -252,6 +260,12 @@ namespace ams::ble::events {
         }
         g_disconnected = false;
         g_bond_complete = false;
+    }
+
+    void RememberAttempted(const bluetooth::Address *address) {
+        std::scoped_lock lk(g_lock);
+        g_attempted = *address;
+        g_have_attempted = true;
     }
 
     bool GetTarget(bluetooth::Address *out) {
@@ -361,6 +375,23 @@ namespace ams::ble::events {
         return g_inquiry_started_tick != 0;
     }
 
+    void NoteClassicActivity() {
+        {
+            std::scoped_lock lk(g_lock);
+            g_classic_activity_tick = os::GetSystemTick().GetInt64Value();
+        }
+        // Wake a scan that is waiting on the queue so it can stop
+        g_ring_event.Signal();
+    }
+
+    bool ClassicActivityWithin(TimeSpan span) {
+        std::scoped_lock lk(g_lock);
+        if (g_classic_activity_tick == 0) {
+            return false;
+        }
+        return (os::GetSystemTick() - os::Tick(g_classic_activity_tick)).ToTimeSpan() < span;
+    }
+
     bool TakeBondComplete() {
         std::scoped_lock lk(g_lock);
         const bool complete = g_bond_complete;
@@ -401,6 +432,11 @@ namespace ams::ble::events {
     u8 GetSpareClientIf() {
         std::scoped_lock lk(g_lock);
         return g_spare_client_if;
+    }
+
+    void ClearSpareClientIf() {
+        std::scoped_lock lk(g_lock);
+        g_spare_client_if = InvalidClientIf;
     }
 
     u32 TakeRingDropped() {
@@ -465,9 +501,26 @@ namespace ams::ble::events {
                     log::Write("evt ScanResult status=0x%02x", info.scan_result.status);
                 }
                 break;
-            case BtdrvBleEventType_ScanFilter:
+            case BtdrvBleEventType_ScanFilter: {
+                // btm retries its scan filter installation every ~120 ms for as long as an LE link is up, and every
+                // attempt fails the same way (result 49): a run of identical results is logged once, with its length
+                // when it ends. Only the host thread logs, so plain statics suffice.
+                static u32 s_last_result = 0;
+                static u32 s_last_action = 0;
+                static u32 s_run = 0;
+                if ((s_run > 0) && (info.scan_filter.result == s_last_result) && (info.scan_filter.action == s_last_action)) {
+                    ++s_run;
+                    break;
+                }
+                if (s_run > 1) {
+                    log::Write("  (repeated %u more times)", s_run - 1);
+                }
                 log::Write("evt ScanFilter result=%u action=%u", info.scan_filter.result, info.scan_filter.action);
+                s_last_result = info.scan_filter.result;
+                s_last_action = info.scan_filter.action;
+                s_run = 1;
                 break;
+            }
             case BtdrvBleEventType_ClientNotify: {
                 auto &notify = info.client_notify;
                 char chr[0x40];
